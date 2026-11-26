@@ -1,0 +1,213 @@
+diff --git a/QcomModulePkg/Library/FastbootLib/FastbootCmds.c b/QcomModulePkg/Library/FastbootLib/FastbootCmds.c
+index 3d6a0e6255ff215a7a5860a24dc5d22d7533cd89..106e875ec2674fc8f1c2f8c37fce9477266eca5c 100644
+--- a/QcomModulePkg/Library/FastbootLib/FastbootCmds.c
++++ b/QcomModulePkg/Library/FastbootLib/FastbootCmds.c
+@@ -140,6 +140,8 @@ CheckVirtualAbCriticalPartition (CHAR16 *PartitionName);
+ 
+ STATIC FASTBOOT_VAR *Varlist;
+ STATIC BOOLEAN Finished = FALSE;
++STATIC BOOLEAN UnInitAttempted = FALSE;
++STATIC EFI_STATUS UnInitStatus = EFI_SUCCESS;
+ 
+ /* Set TRUE by the menu Escape key handler (which runs at TPL_CALLBACK
+  * inside a timer notify and cannot safely call BootFlowChainLoad).
+@@ -2432,19 +2434,27 @@ BOOLEAN FastbootFatal (VOID)
+ EFI_STATUS
+ FastbootCmdsUnInit (VOID)
+ {
+-  EFI_STATUS Status;
++  VOID *Buffer;
++
++  if (UnInitAttempted)
++    return UnInitStatus;
++  UnInitAttempted = TRUE;
+ 
+   if (mDataBuffer) {
+-    Status = GetFastbootDeviceData ()->UsbDeviceProtocol->FreeTransferBuffer (
+-        (VOID *)mDataBuffer);
+-    if (Status != EFI_SUCCESS) {
++    Buffer = mDataBuffer;
++    mDataBuffer = NULL;
++    mUsbDataBuffer = NULL;
++    mFlashDataBuffer = NULL;
++    UnInitStatus = GetFastbootDeviceData ()->UsbDeviceProtocol->FreeTransferBuffer (
++        Buffer);
++    if (EFI_ERROR (UnInitStatus)) {
+       DEBUG ((EFI_D_ERROR, "Failed to free up fastboot buffer\n"));
+-      return Status;
++      return UnInitStatus;
+     }
+   }
+   FastbootUnInit ();
+-  GetFastbootDeviceData ()->UsbDeviceProtocol->Stop ();
+-  return EFI_SUCCESS;
++  UnInitStatus = GetFastbootDeviceData ()->UsbDeviceProtocol->Stop ();
++  return UnInitStatus;
+ }
+ 
+ /* This function must be called to check maximum allocatable chunk for
+@@ -4399,16 +4409,16 @@ DoBootEfi (IN CONST CHAR8 *Arg, IN VOID *Data, IN UINT32 Size,
+   ExitMenuKeysDetection ();
+   FastbootOkay ("");
+   WaitForTransferComplete ();
+-  FastbootUsbDeviceStop ();
+   Finished = TRUE;
++  Status = FastbootUsbDeviceStop ();
++  if (EFI_ERROR (Status))
++    return;
+ 
+   Status = gBS->StartImage (ImageHandle, NULL, NULL);
+ 
+-  /* Only reachable if the staged image returned to its caller rather than
+-   * chainloading another OS.  Log the rc for after-the-fact triage. */
+-  DEBUG ((EFI_D_ERROR,
+-          "oem boot-efi: StartImage returned %r (image exited back to UEFI)\n",
+-          Status));
++  /* An arbitrary child may have exited Boot Services.  No firmware or USB
++   * operation is known safe after it returns. */
++  for (;;) { }
+ }
+ 
+ STATIC VOID
+@@ -4438,8 +4448,8 @@ CmdOemBootEfiBlockIo (IN CONST CHAR8 *Arg, IN VOID *Data, IN UINT32 Size)
+  * stock ABL while GBL itself avoids persistent BCB state. */
+ 
+ /* Shared escape sequence used by `fastboot oem escape` and by the
+- * fastboot menu's deferred Escape dispatch in FastbootMain. Runs at
+- * TPL_APPLICATION in both call sites — see FastbootMain.c main loop. */
++ * fastboot menu's deferred Escape dispatch in FastbootMain. Command
++ * dispatch can itself be deferred to a timer callback. */
+ EFI_STATUS
+ GblFastbootEscapeToBootFlow (VOID)
+ {
+@@ -4449,8 +4459,10 @@ GblFastbootEscapeToBootFlow (VOID)
+    * Without FastbootUsbDeviceStop the host sees "Status read failed". */
+   ExitMenuKeysDetection ();
+   FastbootOkay ("escaping to patched ABL");
+-  FastbootUsbDeviceStop ();
+   Finished = TRUE;
++  Status = FastbootUsbDeviceStop ();
++  if (EFI_ERROR (Status))
++    return Status;
+   Status = BootFlowChainLoad ();
+ 
+   /* Only reachable if chainload returned (shouldn't on success). */
+diff --git a/QcomModulePkg/Library/FastbootLib/FastbootMain.c b/QcomModulePkg/Library/FastbootLib/FastbootMain.c
+index d620c64d0621219aa749ced5a708c68c28eb6170..cccbd0d3f08c4ab487fe3ce559131120fe960c13 100755
+--- a/QcomModulePkg/Library/FastbootLib/FastbootMain.c
++++ b/QcomModulePkg/Library/FastbootLib/FastbootMain.c
+@@ -107,6 +107,7 @@ extern EFI_STATUS GblFastbootEspBootDeferred (VOID);
+ /* Global fastboot data */
+ static FastbootDeviceData Fbd;
+ static USB_DEVICE_DESCRIPTOR_SET DescSet;
++static EFI_STATUS UsbCleanupStatus = EFI_SUCCESS;
+ 
+ STATIC
+ CONST
+@@ -271,22 +272,36 @@ EFI_STATUS
+ FastbootUsbDeviceStop (VOID)
+ {
+   EFI_STATUS Status;
+-
+-  /* Free the Rx & Tx Buffers */
+-  Status = Fbd.UsbDeviceProtocol->FreeTransferBuffer (Fbd.gTxBuffer);
+-  if (EFI_ERROR (Status)) {
+-    DEBUG ((EFI_D_ERROR, "Fastboot USB: Unable to free Tx Buffer\n"));
+-    return Status;
++  VOID *Buffer;
++
++  /* Claim each allocation before release, including when a provider reports
++   * failure: its ownership after a failed release is not specified. */
++  if (Fbd.gTxBuffer != NULL) {
++    Buffer = Fbd.gTxBuffer;
++    Fbd.gTxBuffer = NULL;
++    Status = Fbd.UsbDeviceProtocol->FreeTransferBuffer (Buffer);
++    if (EFI_ERROR (Status) && !EFI_ERROR (UsbCleanupStatus))
++      UsbCleanupStatus = Status;
+   }
+-  Status = Fbd.UsbDeviceProtocol->FreeTransferBuffer (Fbd.gRxBuffer);
+-  if (EFI_ERROR (Status)) {
+-    DEBUG ((EFI_D_ERROR, "Fastboot USB: Unable to free Rx Buffer\n"));
+-    return Status;
++  if (Fbd.gRxBuffer != NULL) {
++    Buffer = Fbd.gRxBuffer;
++    Fbd.gRxBuffer = NULL;
++    Status = Fbd.UsbDeviceProtocol->FreeTransferBuffer (Buffer);
++    if (EFI_ERROR (Status) && !EFI_ERROR (UsbCleanupStatus))
++      UsbCleanupStatus = Status;
+   }
+ 
+-  FreePool ((DescSet.Descriptors));
+-  FreePool ((DescSet.SSDescriptors));
+-  return Status;
++  if (DescSet.Descriptors != NULL) {
++    Buffer = DescSet.Descriptors;
++    DescSet.Descriptors = NULL;
++    FreePool (Buffer);
++  }
++  if (DescSet.SSDescriptors != NULL) {
++    Buffer = DescSet.SSDescriptors;
++    DescSet.SSDescriptors = NULL;
++    FreePool (Buffer);
++  }
++  return UsbCleanupStatus;
+ }
+ 
+ /* Process bulk transfer out come for Rx */
+@@ -357,6 +372,9 @@ EFI_STATUS HandleUsbEvents (VOID)
+   USB_DEVICE_EVENT_DATA Payload;
+   UINTN PayloadSize;
+ 
++  if (FastbootFatal ())
++    return EFI_ABORTED;
++
+   /* Look for Event from Usb device protocol */
+   Fbd.UsbDeviceProtocol->HandleEvent (&Msg, &PayloadSize, &Payload);
+   if (UsbDeviceEventDeviceStateChange == Msg) {
+@@ -416,19 +434,23 @@ EFI_STATUS FastbootInitialize (VOID)
+   StoreRootDeviceType ();
+   /* Wait for USB events in tight loop */
+   while (1) {
++    if (FastbootFatal ())
++      break;
+     Status = HandleUsbEvents ();
+     if (EFI_ERROR (Status) && (Status != EFI_ABORTED)) {
+       DEBUG ((EFI_D_ERROR, "Error, failed to handle USB event\n"));
+       break;
+     }
++    if (FastbootFatal ())
++      break;
+ 
+     /* Menu Escape handler runs at TPL_CALLBACK in a timer notify and
+      * defers the actual chainload here, where we're at TPL_APPLICATION. */
+     if (GblFastbootEscapePending) {
+       GblFastbootEscapePending = FALSE;
+       (VOID)GblFastbootEscapeToBootFlow ();
+-      /* On success BootFlowChainLoad does not return; on failure fall
+-       * through and let the next iteration handle the host. */
++      if (FastbootFatal ())
++        break;
+     }
+ 
+     if (GblFastbootEspBootPending) {
+@@ -444,6 +466,13 @@ EFI_STATUS FastbootInitialize (VOID)
+     }
+   }
+ 
++  /* Release transfer buffers while the protocol is still available. */
++  Status = FastbootUsbDeviceStop ();
++  if (EFI_ERROR (Status)) {
++    DEBUG ((EFI_D_ERROR, "couldnt release fastboot USB resources\n"));
++    return Status;
++  }
++
+   /* Close the fastboot app and stop USB device */
+   Status = FastbootCmdsUnInit ();
+   if (Status != EFI_SUCCESS) {
+@@ -453,6 +482,5 @@ EFI_STATUS FastbootInitialize (VOID)
+ 
+   ExitMenuKeysDetection ();
+ 
+-  Status = FastbootUsbDeviceStop ();
+   return Status;
+ }
