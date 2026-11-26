@@ -2,7 +2,7 @@
 
 This repository publishes a source-only, curated set of committed changes to the GBL chainloader for review and further development. It includes the B1, B2 and B2b integration changes. These safeguards are **experimental**, not a stable release or a claim of device safety. No EFI binary or release asset is distributed here.
 
-The changes include a Fastboot escape path and lifecycle handling, cached ABL PE and patch-site checks, firmware identity checks, protocol-hook rollback and Block I/O protections, along with related host tests. The DICE change originated with upstream work by SuperTurtle (1vivy). These changes interact with boot and verified-boot behavior; review the code and applicability to the exact device and firmware before considering a build.
+The changes include a Fastboot escape path and lifecycle handling, cached ABL PE and patch-site checks, firmware identity checks, protocol-hook rollback and Block I/O protections, along with related host tests. The included DICE patch comes from [an upstream commit](https://github.com/1vivy/gbl-chainload/commit/dc73ef8475d641b6fb3e104b646e0352c19f2875) authored by SuperTurtle (1vivy), built on NullCode1337's earlier myron Mode 2 work. These changes interact with boot and verified-boot behavior; review the code and applicability to the exact device and firmware before considering a build.
 
 ## Contents and provenance
 
